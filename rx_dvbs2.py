@@ -176,13 +176,13 @@ class WideSource:
             sys.exit("espdr not found: run tools/install.sh first (or activate the venv)")
         if "cs4" not in nb.FORMATS:
             sys.exit("the installed espdr has no cs4 format: run tools/install.sh again (it installs esp32-sdr-trx 1.0.0rc4+cs4)")
-        self.port = board.ensure(board.RX, log=log)  # loads the receiver firmware into RAM if needed
+        self.port = board.ensure(board.RX, port=args.device, log=log)  # loads the receiver firmware into RAM if needed
         link = nb.open_link(self.port)
         status, _ = link.command(nb.NB_SET_FORMAT, nb.FORMATS["cs4"], allow=(0, 2))
         link.ser.close()
         if status != 0:
             log("the running firmware has no cs4 format; loading the one of the installed package")
-            self.port = board.ensure(board.RX, load="always", log=log)
+            self.port = board.ensure(board.RX, port=args.device, load="always", log=log)
         # espdr-rx maps 0..49.6 dB to the gain selector 30..80
         self.selector = round(30 + max(0.0, min(49.6, args.gain)) * 50 / 49.6)
 
@@ -235,6 +235,8 @@ def start_espdr(args):
     if not espdr:
         sys.exit("espdr-rx not found: run tools/install.sh first (or activate the venv)")
     cmd = [espdr, "--decim", "3", "--listen", f"{args.host}:{args.port}"]
+    if args.device:
+        cmd += ["--port", args.device]
     if args.ppm:
         cmd += ["--ppm", str(args.ppm)]
     log("starting:", " ".join(cmd))
@@ -295,6 +297,8 @@ def main():
     ap.add_argument("--record", metavar="FILE.ts", help="also write the transport stream to this file")
     ap.add_argument("--no-play", action="store_true", help="do not start ffplay (use with --record or --stdout)")
     ap.add_argument("--stdout", action="store_true", help="write the transport stream to stdout")
+    ap.add_argument("--device", help="the receiver's native USB port, e.g. /dev/serial/by-id/usb-Espressif_..._<MAC>-if00 "
+                                     "(needed when another ESP32 with the same USB id is plugged in, such as the transmitter)")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=1234)
     ap.add_argument("--leandvb", help="path of leandvb (default: build/leansdr/src/apps/leandvb, then PATH)")

@@ -261,7 +261,7 @@ def main():
                     help="LDPC decoder: ldpc_tool (soft decision, about 5 dB better, 32-frame latency) or leandvb's "
                          "bit-flip one; auto takes ldpc_tool when it is installed")
     ap.add_argument("--sampler", choices=("auto", "linear", "rrc"), default="auto",
-                    help="leandvb symbol sampler: auto = rrc below 125 kS/s (many samples per symbol: the default linear sampler "
+                    help="leandvb symbol sampler: auto = rrc below 100 kS/s (many samples per symbol: the default linear sampler "
                          "keeps all the out-of-band noise), else leandvb's default")
     ap.add_argument("--rrc-rej", type=float, default=50, help="leandvb RRC filter rejection with --sampler rrc (default 50)")
     ap.add_argument("-v", "--verbose", action="store_true", help="show leandvb's messages")
@@ -300,7 +300,7 @@ def main():
                 if abs(step) < 5e3:
                     break
 
-        sampler = args.sampler if args.sampler != "auto" else ("rrc" if args.sr < 125e3 else "linear")
+        sampler = args.sampler if args.sampler != "auto" else ("rrc" if args.sr < 100e3 else "linear")
         dvb = subprocess.Popen([leandvb] + src.leandvb_input() + ["--sr", str(int(args.sr)), "--standard", "DVB-S2",
                                 "--const", args.const, "--cr", args.cr, "--fastdrift", "-d",
                                 # only our MODCOD and normal frames: a corrupted PLS header would otherwise start an

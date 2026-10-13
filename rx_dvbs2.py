@@ -84,13 +84,52 @@ class RtlTcp:
         self.s.close()
 
 
+class Decimator:
+    """Streaming lowpass + decimation by d of rtl_tcp cu8 I/Q, out as cf32 in leandvb's --u8 units (u8 - 128).
+
+    Low symbol rates arrive with many samples per symbol (333 ksps: 5 at 66.7 kS/s, 8 at 40 kS/s). Decimating to 2..2.5
+    samples per symbol looked better with 3 noise seeds, but not with 10 (ESP32-ATV rx/test_rx_decim.py: 40 and 66.7 kS/s,
+    Es/N0 9 and 6 dB, about even); what loses lock at low rates is mostly the residual carrier offset. Kept as an option."""
+
+    def __init__(self, fs, sr, d):
+        self.d = d
+        fp, fstop = 0.675 * sr, fs / d - 0.675 * sr      # keep the signal (roll-off 0.35); above fstop aliases into it
+        n = int(np.ceil(5.0 * fs / (fstop - fp))) | 1      # Kaiser window, beta 8: about 80 dB stopband
+        t = np.arange(n) - (n - 1) / 2
+        fc = (fp + fstop) / 2 / fs
+        h = 2 * fc * np.sinc(2 * fc * t) * np.kaiser(n, 8.0)
+        self.h = (h / h.sum()).astype(np.float32)
+        self.hist = np.zeros(n - 1, np.complex64)          # the last n - 1 input samples
+        self.phase = 0                                     # index, in the next block, of the next sample to keep
+        self.odd = b""                                     # half an I/Q pair left from the previous block
+
+    def process(self, data):
+        data = self.odd + data
+        k = len(data) // 2 * 2
+        self.odd = data[k:]
+        if not k:
+            return b""
+        b = np.frombuffer(data[:k], np.uint8).astype(np.float32) - 128.0
+        x = np.concatenate((self.hist, (b[0::2] + 1j * b[1::2]).astype(np.complex64)))
+        m = k // 2
+        y = np.convolve(x, self.h, "valid")                # y[i]: filter output at new sample i
+        out = y[self.phase::self.d]
+        self.phase = (self.phase - m) % self.d
+        self.hist = x[len(x) - len(self.hist):]
+        return out.astype(np.complex64).tobytes()
+
+
 class NarrowSource:
-    """espdr-rx's rtl_tcp server: 333 ksps cu8."""
+    """espdr-rx's rtl_tcp server: 333 ksps cu8 (optionally decimated to cf32 for leandvb)."""
 
     fs = FS
 
     def __init__(self, args):
         self.args = args
+        self.dec = None
+
+    def decimate(self, sr, d):
+        self.dec = Decimator(FS, sr, d)
 
     def grab(self, freq, seconds):
         rx = RtlTcp(self.args.host, self.args.port)
@@ -101,6 +140,8 @@ class NarrowSource:
         return b[0::2] + 1j * b[1::2]
 
     def leandvb_input(self):
+        if self.dec:
+            return ["--f32", "--float-scale", "1", "-f", str(round(FS / self.dec.d))]
         return ["--u8", "-f", str(FS)]
 
     def start(self, freq, sink):
@@ -110,7 +151,7 @@ class NarrowSource:
             rx.setup(freq, self.args.gain)
             try:
                 while d := rx.s.recv(65536):
-                    sink.write(d)
+                    sink.write(self.dec.process(d) if self.dec else d)
             except (BrokenPipeError, OSError, ValueError):
                 pass
             finally:
@@ -263,6 +304,9 @@ def main():
     ap.add_argument("--sampler", choices=("auto", "linear", "rrc"), default="auto",
                     help="leandvb symbol sampler: auto = rrc below 100 kS/s (many samples per symbol: the default linear sampler "
                          "keeps all the out-of-band noise), else leandvb's default")
+    ap.add_argument("--decimate", action="store_true",
+                    help="experimental: below 100 kS/s (without --wide) lowpass and decimate the 333 ksps stream by the largest D "
+                         "that leaves at least 2 samples per symbol, before leandvb (no clear gain in simulation)")
     ap.add_argument("--rrc-rej", type=float, default=50, help="leandvb RRC filter rejection with --sampler rrc (default 50)")
     ap.add_argument("-v", "--verbose", action="store_true", help="show leandvb's messages")
     args = ap.parse_args()
@@ -300,6 +344,10 @@ def main():
                 if abs(step) < 5e3:
                     break
 
+        if not args.wide and args.decimate and args.sr < 100e3 and FS // (2 * args.sr) >= 2:
+            d = int(FS // (2 * args.sr))
+            src.decimate(args.sr, d)
+            log(f"decimating {FS / 1e3:.0f} ksps by {d} to {FS / d / 1e3:.1f} ksps ({FS / d / args.sr:.2f} samples per symbol)")
         sampler = args.sampler if args.sampler != "auto" else ("rrc" if args.sr < 100e3 else "linear")
         dvb = subprocess.Popen([leandvb] + src.leandvb_input() + ["--sr", str(int(args.sr)), "--standard", "DVB-S2",
                                 "--const", args.const, "--cr", args.cr, "--fastdrift", "-d",

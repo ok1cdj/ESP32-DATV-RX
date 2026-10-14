@@ -84,6 +84,30 @@ class RtlTcp:
         self.s.close()
 
 
+class DcBlock:
+    """cu8 I/Q from rtl_tcp -> complex64 in leandvb's --u8 units (u8 - 128) without the receiver's own DC.
+
+    The 8-bit stream keeps the ESP32-S3's DC (LO leakage, ADC offset) at 0 Hz; the cs4 mode removes it on the chip. When
+    the transmitter's carrier comes within a few kHz of the LO (the C3 drifts by tens of kHz) the line sits inside the
+    signal and nothing decodes. A running mean (blocks of ~0.1 s, smoothed) is taken off: a notch a few Hz wide."""
+
+    def __init__(self):
+        self.dc = None
+        self.odd = b""                                     # half an I/Q pair left from the previous block
+
+    def process(self, data):
+        data = self.odd + data
+        k = len(data) // 2 * 2
+        self.odd = data[k:]
+        if not k:
+            return np.zeros(0, np.complex64)
+        b = np.frombuffer(data[:k], np.uint8).astype(np.float32) - 128.0
+        x = (b[0::2] + 1j * b[1::2]).astype(np.complex64)
+        m = x.mean()
+        self.dc = m if self.dc is None else self.dc + (m - self.dc) * min(1.0, 0.2 * len(x) / 30000)
+        return (x - self.dc).astype(np.complex64)
+
+
 class Decimator:
     """Streaming lowpass + decimation by d of rtl_tcp cu8 I/Q, out as cf32 in leandvb's --u8 units (u8 - 128).
 
@@ -103,15 +127,12 @@ class Decimator:
         self.phase = 0                                     # index, in the next block, of the next sample to keep
         self.odd = b""                                     # half an I/Q pair left from the previous block
 
-    def process(self, data):
-        data = self.odd + data
-        k = len(data) // 2 * 2
-        self.odd = data[k:]
-        if not k:
+    def process(self, samples):
+        """complex64 samples (DcBlock output) -> decimated cf32 bytes."""
+        if not len(samples):
             return b""
-        b = np.frombuffer(data[:k], np.uint8).astype(np.float32) - 128.0
-        x = np.concatenate((self.hist, (b[0::2] + 1j * b[1::2]).astype(np.complex64)))
-        m = k // 2
+        x = np.concatenate((self.hist, samples))
+        m = len(samples)
         y = np.convolve(x, self.h, "valid")                # y[i]: filter output at new sample i
         out = y[self.phase::self.d]
         self.phase = (self.phase - m) % self.d
@@ -120,7 +141,7 @@ class Decimator:
 
 
 class NarrowSource:
-    """espdr-rx's rtl_tcp server: 333 ksps cu8 (optionally decimated to cf32 for leandvb)."""
+    """espdr-rx's rtl_tcp server: 333 ksps cu8 -> without its DC -> cf32 for leandvb (optionally decimated)."""
 
     fs = FS
 
@@ -137,21 +158,24 @@ class NarrowSource:
         rx.read(int(0.3 * FS) * 2)  # retune settling
         b = np.frombuffer(rx.read(int(seconds * FS) * 2), np.uint8).astype(np.float32) - 127.5
         rx.close()
-        return b[0::2] + 1j * b[1::2]
+        x = b[0::2] + 1j * b[1::2]
+        return x - x.mean()                                # the receiver's DC would look like a narrow signal
 
     def leandvb_input(self):
         if self.dec:
             return ["--f32", "--float-scale", "1", "-f", str(round(FS / self.dec.d))]
-        return ["--u8", "-f", str(FS)]
+        return ["--f32", "--float-scale", "1", "-f", str(FS)]        # u8 - 128 units, as --u8 would have it
 
     def start(self, freq, sink):
         """Streams to sink.write() from a thread until the server closes or sink fails."""
         def pump():
             rx = RtlTcp(self.args.host, self.args.port)
             rx.setup(freq, self.args.gain)
+            dc = DcBlock()
             try:
                 while d := rx.s.recv(65536):
-                    sink.write(self.dec.process(d) if self.dec else d)
+                    x = dc.process(d)
+                    sink.write(self.dec.process(x) if self.dec else x.tobytes())
             except (BrokenPipeError, OSError, ValueError):
                 pass
             finally:

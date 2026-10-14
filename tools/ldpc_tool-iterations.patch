@@ -1,0 +1,13 @@
+--- a/ldpc_tool.cc
++++ b/ldpc_tool.cc
+@@ -142,6 +142,10 @@
+ 			}
+ 		}
+ 
++#ifdef ITER_REPORT
++		// measurements (ESP32-DATV-RX tools/sim_wide.py): mean LDPC iterations per frame of this batch
++		fprintf(stderr, "\nldpc_tool iterations %.1f\n", (double)iterations / BLOCKS);
++#endif
+ 		for (int i = 0; i < BLOCKS * CODE_LEN; ++i)
+ 			assert(!std::isnan(code[i]));
+ 

@@ -78,8 +78,9 @@ def decode(x, fs, args):
     cmd += ["--ldpc-helper", args.ldpc_helper] if args.ldpc_helper else ["--ldpc-bf", "100"]
     # Accept only QPSK 3/4 normal frames: a corrupted PLS would otherwise start an ldpc_tool for a random
     # modcod that waits forever for its batch of 32 frames.
-    cmd += ["--modcods", str(1 << 7), "--framesizes", "1"]
+    cmd += ["--modcods", str(1 << 7), "--framesizes", {"normal": "1", "short": "2", "auto": "3"}[args.frame]]
     cmd += args.extra.split() if args.extra else []
+    first = None                                   # seconds from the start of the input to the first TS bytes (--realtime)
     if not args.realtime:
         p = subprocess.run(cmd, input=data, capture_output=True, timeout=600)
         err, ts = p.stderr.decode(errors="ignore"), len(p.stdout) // 188
@@ -87,9 +88,17 @@ def decode(x, fs, args):
         # Feed at the sample rate, like the live receiver, then linger so that batches in flight
         # (ldpc_tool decodes 32 frames at a time) come back before leandvb sees the end of its input.
         p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        out, errb = [], []
-        readers = [threading.Thread(target=lambda f=f, a=a: a.append(f.read()), daemon=True)
-                   for f, a in ((p.stdout, out), (p.stderr, errb))]
+        out, errb, t_first = [], [], []
+
+        def read_ts(f):
+            chunks = []
+            while d := f.read1(65536):
+                if not t_first:
+                    t_first.append(time.monotonic())
+                chunks.append(d)
+            out.append(b"".join(chunks))
+        readers = [threading.Thread(target=read_ts, args=(p.stdout,), daemon=True),
+                   threading.Thread(target=lambda: errb.append(p.stderr.read()), daemon=True)]
         for t in readers:
             t.start()
         chunk = int(fs * 0.05) * 8  # 50 ms of cf32
@@ -115,9 +124,12 @@ def decode(x, fs, args):
         for t in readers:
             t.join(10)
         err, ts = errb[0].decode(errors="ignore"), len(out[0]) // 188
+        first = t_first[0] - t0 if t_first else None
     # leandvb -d prints '_' per clean frame, '.' per frame corrected by BCH and '!' per failed one,
     # without newlines; dots also occur in other lines, so only '_' and '!' are counted.
-    return err.count("_"), err.count("!"), err.count("LOCKED"), ts
+    # ldpc_tool with ITER_REPORT (tools/ldpc_tool-iterations.patch, measurements only) prints "ldpc_tool iterations X"
+    iters = [float(v) for v in re.findall(r"ldpc_tool iterations ([0-9.]+)", err)]
+    return err.count("_"), err.count("!"), err.count("LOCKED"), ts, first, (sum(iters) / len(iters) if iters else None)
 
 
 def main():
@@ -138,9 +150,11 @@ def main():
     ap.add_argument("--realtime", action="store_true", help="feed leandvb at the sample rate, as in a live run")
     ap.add_argument("--linger", type=float, default=15, help="with --realtime: seconds to wait at the end (default 15)")
     ap.add_argument("--extra", help="more leandvb options")
+    ap.add_argument("--frame", choices=("normal", "short", "auto"), default="normal", help="FECFRAME size (--framesizes)")
+    ap.add_argument("--seed", type=int, default=1, help="noise seed (default 1)")
     args = ap.parse_args()
 
-    rng = np.random.default_rng(1)
+    rng = np.random.default_rng(args.seed)
     x = np.fromfile(args.ref, np.complex64)
     x = x - x.mean()
     if args.esn0 is not None:
@@ -152,11 +166,13 @@ def main():
     clip = 0.0
     if args.bits < 16:
         x, clip = quantize(x, args.bits, args.scale, args.block, args.target)
-    good, bad, locks, ts = decode(x, args.fs_out, args)
+    good, bad, locks, ts, first, iters = decode(x, args.fs_out, args)
     total = good + bad
     label = (f"{'ldpc_tool' if args.ldpc_helper else 'bit-flip '} fs {args.fs_out / 1e3:6.1f}k ({args.fs_out / args.sr:.2f} sps) bits {args.bits:2d} {args.scale:5s} "
              f"Es/N0 {'-' if args.esn0 is None else args.esn0:>4} fade {args.fade:g} dB")
-    print(f"{label}: frames ok {good:3d} bad {bad:3d} locks {locks} TS {ts:5d} clip {100 * clip:.2f}%", flush=True)
+    print(f"{label} {args.frame}: frames ok {good:3d} bad {bad:3d} locks {locks} TS {ts:5d} clip {100 * clip:.2f}%"
+          + (f" first TS {first:.1f} s" if first is not None else " first TS -" if args.realtime else "")
+          + (f" LDPC iterations {iters:.1f}" if iters is not None else ""), flush=True)
 
 
 if __name__ == "__main__":

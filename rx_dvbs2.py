@@ -42,6 +42,12 @@ MODCODS.update({("16APSK", r): i + 18 for i, r in enumerate(("2/3", "3/4", "4/5"
 MODCODS.update({("32APSK", r): i + 24 for i, r in enumerate(("3/4", "4/5", "5/6", "8/9", "9/10"))})
 
 
+def plframe_symbols(const, normal=True, pilots=True):
+    """Symbols of one PLFRAME: PLHEADER, data slots of 90 symbols, a 36-symbol pilot block after every 16 slots."""
+    slots = (64800 if normal else 16200) // {"QPSK": 2, "8PSK": 3, "16APSK": 4, "32APSK": 5}[const] // 90
+    return 90 + 90 * slots + (36 * ((slots - 1) // 16) if pilots else 0)
+
+
 def find_tool(name, *candidates):
     for c in candidates:
         if c and os.path.isfile(c) and os.access(c, os.X_OK):
@@ -314,6 +320,9 @@ def main():
                     help="symbol rate in S/s (default 125000; at most about 200000, with --wide about 333000)")
     ap.add_argument("--wide", action="store_true", help="500 ksps 4-bit mode for symbol rates above 200 kS/s")
     ap.add_argument("--cr", default="3/4", help="code rate (default 3/4)")
+    ap.add_argument("--frame", choices=("normal", "short", "auto"), default="normal",
+                    help="DVB-S2 FECFRAME size to decode: normal (64800 bits, default), short (16200) or auto (both; a "
+                         "corrupted PLS header may then start an ldpc_tool for the other size)")
     ap.add_argument("--const", default="QPSK", help="constellation (default QPSK)")
     ap.add_argument("--gain", type=float, default=10, help="receiver gain in dB, 0..49.6 (default 10)")
     ap.add_argument("--ppm", type=float, default=0, help="crystal correction passed to espdr-rx")
@@ -385,7 +394,8 @@ def main():
                                 "--const", args.const, "--cr", args.cr, "--fastdrift", "-d",
                                 # only our MODCOD and normal frames: a corrupted PLS header would otherwise start an
                                 # ldpc_tool for a random MODCOD, which then waits for its batch of 32 frames forever
-                                "--modcods", str(1 << modcod), "--framesizes", "1"]
+                                "--modcods", str(1 << modcod),
+                                "--framesizes", {"normal": "1", "short": "2", "auto": "3"}[args.frame]]
                                + (["--ldpc-helper", ldpc_tool] if ldpc_tool else ["--ldpc-bf", "100"])
                                + (["--sampler", "rrc", "--rrc-rej", str(args.rrc_rej)] if sampler == "rrc"
                                   else ["--sampler", "linear"] if args.sampler == "linear" else [])
@@ -450,7 +460,7 @@ def main():
             f"LDPC {'ldpc_tool' if ldpc_tool else 'bit-flip'}. Ctrl-C ends.")
         if ldpc_tool:
             log(f"ldpc_tool decodes 32 frames at a time: the first picture comes after about "
-                f"{32 * 33282 / args.sr:.0f} s")
+                f"{32 * plframe_symbols(args.const, args.frame != 'short') / args.sr:.0f} s")
         last = None
         while dvb.poll() is None and (args.no_play or procs[-1].poll() is None):
             time.sleep(5)

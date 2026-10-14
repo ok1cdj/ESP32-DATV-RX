@@ -348,11 +348,15 @@ def main():
                 if abs(step) < 5e3:
                     break
 
+        fs_in = FS_WIDE if args.wide else FS
         if not args.wide and args.decimate and args.sr < 100e3 and FS // (2 * args.sr) >= 2:
             d = int(FS // (2 * args.sr))
+            fs_in = FS / d
             src.decimate(args.sr, d)
             log(f"decimating {FS / 1e3:.0f} ksps by {d} to {FS / d / 1e3:.1f} ksps ({FS / d / args.sr:.2f} samples per symbol)")
         sampler = args.sampler if args.sampler != "auto" else ("rrc" if args.sr < 100e3 else "linear")
+        # --fd-info on a pipe of its own: MER, CNR, FREQ (residual carrier offset, Hz) for the status line
+        info_r, info_w = os.pipe()
         dvb = subprocess.Popen([leandvb] + src.leandvb_input() + ["--sr", str(int(args.sr)), "--standard", "DVB-S2",
                                 "--const", args.const, "--cr", args.cr, "--fastdrift", "-d",
                                 # only our MODCOD and normal frames: a corrupted PLS header would otherwise start an
@@ -360,8 +364,10 @@ def main():
                                 "--modcods", str(1 << modcod), "--framesizes", "1"]
                                + (["--ldpc-helper", ldpc_tool] if ldpc_tool else ["--ldpc-bf", "100"])
                                + (["--sampler", "rrc", "--rrc-rej", str(args.rrc_rej)] if sampler == "rrc"
-                                  else ["--sampler", "linear"] if args.sampler == "linear" else []),
-                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                                  else ["--sampler", "linear"] if args.sampler == "linear" else [])
+                               + ["--fd-info", str(info_w)] + (["--cnr"] if fs_in > 3 * args.sr else []),
+                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, pass_fds=(info_w,))
+        os.close(info_w)
         procs.append(dvb)
         sinks = []
         if not args.no_play:
@@ -383,6 +389,14 @@ def main():
             sinks.append(sys.stdout.buffer)
 
         stats = {"good": 0, "bad": 0, "locks": 0, "ts": 0}
+        info = {}
+
+        def pump_info():
+            with os.fdopen(info_r, "r", errors="ignore") as f:
+                for line in f:
+                    k, _, v = line.strip().partition(" ")
+                    if k in ("MER", "CNR", "FREQ", "LOCK"):
+                        info[k] = v
 
         def pump_ts():
             while d := dvb.stdout.read1(65536):
@@ -405,7 +419,7 @@ def main():
                     sys.stderr.write(t)
 
         src.start(freq, dvb.stdin)
-        for fn in (pump_ts, pump_log):
+        for fn in (pump_ts, pump_log, pump_info):
             threading.Thread(target=fn, daemon=True).start()
 
         log(f"receiving {freq / 1e6:.4f} MHz, {args.sr / 1e3:g} kS/s {args.const} {args.cr}, gain {args.gain:g} dB, "
@@ -417,9 +431,11 @@ def main():
         while dvb.poll() is None and (args.no_play or procs[-1].poll() is None):
             time.sleep(5)
             now = (stats["good"], stats["bad"], stats["locks"], stats["ts"])
-            if now != last:
+            q = "".join(f", {k} {info[k]}" + (" dB" if k in ("MER", "CNR") else " Hz" if k == "FREQ" else "")
+                        for k in ("MER", "CNR", "FREQ") if k in info)
+            if now != last or q:
                 log(f"frames ok {stats['good']}, with errors {stats['bad']}, locks {stats['locks']}, "
-                    f"TS packets {stats['ts']}")
+                    f"TS packets {stats['ts']}{q}")
                 last = now
     except KeyboardInterrupt:
         pass

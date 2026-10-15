@@ -108,6 +108,7 @@ without errors. Ctrl-C or closing the window ends it.
 | `--wide` | | 500 ksps cs4: symbol rates up to about 333000 |
 | `--sr S/s` | 125000 | symbol rate (without `--wide` about 200000 at most, see below) |
 | `--cr`, `--const` | 3/4, QPSK | code rate and constellation |
+| `--frame` | normal | DVB-S2 FECFRAME size: `normal`, `short` (16200 bits) or `auto` (both) |
 | `--gain dB` | 10 | receiver gain, 0 to 49.6 dB |
 | `--no-search` | | tune exactly to `--freq` |
 | `--record FILE.ts` | | also save the transport stream |
@@ -130,6 +131,9 @@ packets per second).
   test (`tools/sim_wide.py --realtime`) it decoded down to Es/N0 ≈ 8 dB where leandvb's bit-flip decoder needed 13 to
   14 dB: about **5 dB** more margin. It decodes 32 frames at a time, so the picture comes about 3 s (333 kS/s) or 9 s
   (125 kS/s) late. Below about 8 dB leandvb's carrier and frame lock, not the LDPC, is the limit.
+- **Short frames:** a transmitter sending DVB-S2 short frames (`--frame short`) fills the 32-frame batch of ldpc_tool
+  4 times sooner, which matters at low symbol rates: in simulation the first picture came after 5 to 8 s instead of
+  40 to 59 s at 40 to 66 kS/s, at the same threshold (about Es/N0 4.5 dB for QPSK 3/4).
 - **Margin at 333 kS/s:** the same power spreads over 2.7 times the bandwidth, so the signal stands only about 11 to
   14 dB above the floor where 125 kS/s showed 25 to 30 dB. With ldpc_tool that leaves a few dB; keep the antennas
   close.

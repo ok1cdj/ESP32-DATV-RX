@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """rx_dvbs2.py: receive a DVB-S2 transmission with an ESP32-S3 and show it.
 
-    ESP32-S3 (espdr-rx, rtl_tcp, 333 ksps) -> leandvb (DVB-S2) -> ffmpeg (retime) -> ffplay
-    ESP32-S3 (--wide: espdr.nb, packed 4-bit I/Q, 500 ksps) -> leandvb -> ffmpeg -> ffplay
+    ESP32-S3 (espdr-rx, rtl_tcp, 333 ksps) -> leandvb (DVB-S2) -> ffplay (picture and sound)
+    ESP32-S3 (--wide: espdr.nb, packed 4-bit I/Q, 500 ksps) -> leandvb -> ffplay
+
+The player starts at the first PMT: a service with sound plays as it is (ffplay keeps picture and sound together
+on the sound's clock); one without sound (the stand-alone beacon of ESP32-DATV-SA) goes through ffmpeg, which
+retimes the pictures - the beacon starts its time base again on every loop. --no-sound: always the latter.
 
 It starts espdr-rx when no rtl_tcp server is listening (espdr-rx loads the receiver firmware into the
 board's RAM when needed), looks for the signal near the given frequency, tunes to its centre and plays
@@ -357,6 +361,39 @@ def search(src, freq):
     return centre
 
 
+def ts_has_sound(buf):
+    """Whether the service of the first PMT in buf has an audio stream; None: no PMT yet."""
+    pmt_pid = None
+    i = 0
+    n = len(buf)
+    while i + 188 <= n:
+        if buf[i] != 0x47:
+            i += 1
+            continue
+        pid = ((buf[i + 1] & 0x1F) << 8) | buf[i + 2]
+        pusi = buf[i + 1] & 0x40
+        afc = (buf[i + 3] >> 4) & 3
+        p = i + 4 + (1 + buf[i + 4] if afc & 2 else 0)
+        if pusi and afc & 1 and p < i + 188:
+            s = p + 1 + buf[p]                                  # after the pointer field
+            if s + 12 <= i + 188:
+                if pid == 0 and buf[s] == 0x00:
+                    for k in range(s + 8, s + 3 + (((buf[s + 1] & 0x0F) << 8) | buf[s + 2]) - 4, 4):
+                        if (buf[k] << 8 | buf[k + 1]) != 0:
+                            pmt_pid = ((buf[k + 2] & 0x1F) << 8) | buf[k + 3]
+                            break
+                elif pid == pmt_pid and buf[s] == 0x02:
+                    end = min(i + 188, s + 3 + (((buf[s + 1] & 0x0F) << 8) | buf[s + 2]) - 4)
+                    k = s + 12 + (((buf[s + 10] & 0x0F) << 8) | buf[s + 11])
+                    while k + 5 <= end:
+                        if buf[k] in (0x03, 0x04, 0x0F, 0x11, 0x81, 0x87):     # MPEG audio, AAC ADTS / LATM, AC-3
+                            return True
+                        k += 5 + (((buf[k + 3] & 0x0F) << 8) | buf[k + 4])
+                    return False
+        i += 188
+    return None
+
+
 def main():
     # Run inside the project's venv (numpy, espdr) when started as ./rx_dvbs2.py with the system Python.
     venv_python = os.path.join(HERE, ".venv", "bin", "python")
@@ -382,6 +419,7 @@ def main():
     ap.add_argument("--record", metavar="FILE.ts", help="also write the transport stream to this file")
     ap.add_argument("--no-play", action="store_true", help="do not start ffplay (use with --record or --stdout)")
     ap.add_argument("--stdout", action="store_true", help="write the transport stream to stdout")
+    ap.add_argument("--no-sound", action="store_true", help="play the picture only (retimed), even when there is sound")
     ap.add_argument("--device", help="the receiver's native USB port, e.g. /dev/serial/by-id/usb-Espressif_..._<MAC>-if00 "
                                      "(needed when another ESP32 with the same USB id is plugged in, such as the transmitter)")
     ap.add_argument("--host", default="127.0.0.1")
@@ -461,19 +499,31 @@ def main():
         os.close(info_w)
         procs.append(dvb)
         sinks = []
-        if not args.no_play:
+        player = {"pending": bytearray() if not args.no_play else None, "proc": None}
+
+        def start_player(sound):
+            """ffplay on the TS when it has sound (synchronised to it), else ffmpeg retiming the pictures -> ffplay"""
+            # SDL's GLX path fails on some X11 setups; EGL works there and elsewhere.
+            env = dict(os.environ, SDL_VIDEO_X11_FORCE_EGL=os.environ.get("SDL_VIDEO_X11_FORCE_EGL", "1"))
+            title = ["-window_title", f"DVB-S2 {freq / 1e6:.4f} MHz (ESP32-S3 RX)"]
+            if sound:
+                # -infbuf: read everything at once (ldpc_tool hands out frames in batches; ffplay must not block leandvb)
+                ffplay = subprocess.Popen(["ffplay", "-hide_banner", "-loglevel", "error", "-infbuf", "-probesize", "64000",
+                                           "-analyzeduration", "3000000"] + title + ["-i", "-"], stdin=subprocess.PIPE, env=env)
+                procs.append(ffplay)
+                player["proc"] = ffplay
+                return ffplay.stdin
             ffmpeg = subprocess.Popen(["ffmpeg", "-hide_banner", "-loglevel", "fatal", "-probesize", "64000",
                                        "-analyzeduration", "3000000", "-fflags", "+igndts+genpts", "-i", "-",
                                        "-vf", "setpts=N/25/TB", "-an", "-c:v", "rawvideo", "-pix_fmt", "yuv420p",
                                        "-f", "nut", "-"], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
-            # SDL's GLX path fails on some X11 setups; EGL works there and elsewhere.
-            env = dict(os.environ, SDL_VIDEO_X11_FORCE_EGL=os.environ.get("SDL_VIDEO_X11_FORCE_EGL", "1"))
-            ffplay = subprocess.Popen(["ffplay", "-hide_banner", "-loglevel", "error", "-fflags", "nobuffer",
-                                       "-window_title", f"DVB-S2 {freq / 1e6:.4f} MHz (ESP32-S3 RX)", "-i", "-"],
+            ffplay = subprocess.Popen(["ffplay", "-hide_banner", "-loglevel", "error", "-fflags", "nobuffer"] + title + ["-i", "-"],
                                       stdin=ffmpeg.stdout, env=env)
             ffmpeg.stdout.close()
-            procs += [ffmpeg, ffplay]
-            sinks.append(ffmpeg.stdin)
+            procs.extend([ffmpeg, ffplay])
+            player["proc"] = ffplay
+            return ffmpeg.stdin
+
         if args.record:
             sinks.append(open(args.record, "wb"))
         if args.stdout:
@@ -497,6 +547,20 @@ def main():
         def pump_ts():
             while d := dvb.stdout.read1(65536):
                 stats["ts"] += len(d) // 188
+                pend = player["pending"]
+                if pend is not None:
+                    # the player waits for the first PMT (sound or not); 2 MB without one: picture only
+                    pend += d
+                    sound = False if args.no_sound else ts_has_sound(pend)
+                    if sound is None and len(pend) > 2_000_000:
+                        sound = False
+                    if sound is not None:
+                        log("sound: yes, played with the picture" if sound else "no sound: picture only")
+                        sinks.append(start_player(sound))
+                        d = bytes(pend)
+                        player["pending"] = None
+                    else:
+                        continue
                 for s in list(sinks):
                     try:
                         s.write(d)
@@ -524,7 +588,7 @@ def main():
             log(f"ldpc_tool decodes 32 frames at a time: the first picture comes after about "
                 f"{32 * plframe_symbols(args.const, args.frame != 'short') / args.sr:.0f} s")
         last = None
-        while dvb.poll() is None and (args.no_play or procs[-1].poll() is None):
+        while dvb.poll() is None and (args.no_play or player["proc"] is None or player["proc"].poll() is None):
             time.sleep(5)
             now = (stats["good"], stats["bad"], stats["locks"], stats["ts"])
             q = "".join(f", {k} {info[k]}" + (" dB" if k in ("MER", "CNR") else " Hz" if k == "FREQ" else "")

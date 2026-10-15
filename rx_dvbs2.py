@@ -376,6 +376,9 @@ def main():
     ap.add_argument("--ppm", type=float, default=0, help="crystal correction passed to espdr-rx")
     ap.add_argument("--no-search", action="store_true", help="tune exactly to --freq, do not look for the signal")
     ap.add_argument("--no-track", action="store_true", help="do not follow the transmitter's drift (software NCO)")
+    ap.add_argument("--sr-tol", type=float, default=0.002,
+                    help="symbol rate tolerance (leandvb --sr-tol, default 0.002 = 2000 ppm; leandvb's own 100 ppm misses an "
+                         "ESP32-C3 loop from the flash at 333333 Bd when tuned to 333000)")
     ap.add_argument("--record", metavar="FILE.ts", help="also write the transport stream to this file")
     ap.add_argument("--no-play", action="store_true", help="do not start ffplay (use with --record or --stdout)")
     ap.add_argument("--stdout", action="store_true", help="write the transport stream to stdout")
@@ -452,6 +455,7 @@ def main():
                                # search; leandvb's first lock on normal frames is often a false one (MER < 0) and this gets
                                # out of it sooner (ESP32-ATV rx/sim_lock.py: first TS 31-40 s instead of 34-44 s or none)
                                + (["--fastlock"] if args.sr < 100e3 else [])
+                               + ["--sr-tol", str(args.sr_tol)]
                                + ["--fd-info", str(info_w)] + (["--cnr"] if fs_in > 3 * args.sr else []),
                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, pass_fds=(info_w,))
         os.close(info_w)

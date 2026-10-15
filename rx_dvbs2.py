@@ -399,6 +399,10 @@ def main():
                                + (["--ldpc-helper", ldpc_tool] if ldpc_tool else ["--ldpc-bf", "100"])
                                + (["--sampler", "rrc", "--rrc-rej", str(args.rrc_rej)] if sampler == "rrc"
                                   else ["--sampler", "linear"] if args.sampler == "linear" else [])
+                               # below 100 kS/s: no ~5 normal frames of data (4 s at 40 kS/s) thrown away before each new
+                               # search; leandvb's first lock on normal frames is often a false one (MER < 0) and this gets
+                               # out of it sooner (ESP32-ATV rx/sim_lock.py: first TS 31-40 s instead of 34-44 s or none)
+                               + (["--fastlock"] if args.sr < 100e3 else [])
                                + ["--fd-info", str(info_w)] + (["--cnr"] if fs_in > 3 * args.sr else []),
                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, pass_fds=(info_w,))
         os.close(info_w)

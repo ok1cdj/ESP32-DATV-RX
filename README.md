@@ -131,6 +131,9 @@ packets per second).
   test (`tools/sim_wide.py --realtime`) it decoded down to Es/N0 ≈ 8 dB where leandvb's bit-flip decoder needed 13 to
   14 dB: about **5 dB** more margin. It decodes 32 frames at a time, so the picture comes about 3 s (333 kS/s) or 9 s
   (125 kS/s) late. Below about 8 dB leandvb's carrier and frame lock, not the LDPC, is the limit.
+- **First lock below 100 kS/s:** leandvb's first lock on normal frames is often a false one (MER below 0, carrier
+  several kHz off); `rx_dvbs2.py` runs it with `--fastlock` there, so that it searches again at once instead of
+  throwing away about 5 frames of signal first.
 - **Short frames:** a transmitter sending DVB-S2 short frames (`--frame short`) fills the 32-frame batch of ldpc_tool
   4 times sooner, which matters at low symbol rates: in simulation the first picture came after 5 to 8 s instead of
   40 to 59 s at 40 to 66 kS/s, at the same threshold (about Es/N0 4.5 dB for QPSK 3/4).

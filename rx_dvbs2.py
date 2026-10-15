@@ -12,6 +12,7 @@ the transport stream. Ctrl-C or closing the video window ends it.
 1.0.0rc4+cs4, installed by tools/install.sh); 333 ksps int8 through rtl_tcp is limited to about 200 kS/s.
 """
 import argparse
+import math
 import os
 import shutil
 import signal
@@ -114,6 +115,47 @@ class DcBlock:
         return (x - self.dc).astype(np.complex64)
 
 
+class Nco:
+    """Software tuning that follows the transmitter's drift: shifts the samples by -freq (Hz) before leandvb, with a
+    continuous phase across blocks. The ESP32-C3 has no TCXO and drifts by some 260 Hz/s while warming up after a
+    reset; leandvb itself only follows +-sr/4 (--freq-tol 0.25) and loses the signal beyond it (seen on the bench).
+    A first-order loop on leandvb's FREQ (the offset left after the NCO): the NCO frequency ramps at K x residual Hz/s,
+    at most RATE_MAX, smoothly block by block - no steps, which upset leandvb's lock at low symbol rates. A linear drift
+    of r Hz/s leaves r / K behind (260 Hz/s: about 500 Hz, well inside leandvb's range)."""
+
+    K = 0.5                                                # 1/s
+    RATE_MAX = 600.0                                       # Hz/s
+
+    def __init__(self, fs):
+        self.fs = fs
+        self.freq = 0.0                                    # Hz
+        self.rate = 0.0                                    # Hz/s, set by track(), applied by process()
+        self.phase = 0.0                                   # cycles
+        self.updates = 0
+        self.last = None
+
+    def process(self, x):
+        n = len(x)
+        if self.rate == 0.0 and self.freq == 0.0:
+            return x
+        dt = n / self.fs
+        f0, f1 = self.freq, self.freq + self.rate * dt     # a linear ramp over the block: a continuous frequency
+        t = np.arange(n) / self.fs
+        ph = self.phase - (f0 * t + 0.5 * (f1 - f0) / dt * t * t)
+        self.phase = (self.phase - (f0 + f1) / 2 * dt) % 1.0
+        self.freq = f1
+        return (x * np.exp(2j * np.pi * ph)).astype(np.complex64)
+
+    def track(self, residual, mer, framelock):
+        """Called with leandvb's FREQ, MER and FRAMELOCK. Holds (rate 0) unless the signal is live: on noise a stale lock
+        would walk the NCO away."""
+        if not framelock or mer is None or not mer > 3:
+            self.rate = 0.0
+            return
+        self.rate = max(-self.RATE_MAX, min(self.RATE_MAX, self.K * residual))
+        self.updates += 1
+
+
 class Decimator:
     """Streaming lowpass + decimation by d of rtl_tcp cu8 I/Q, out as cf32 in leandvb's --u8 units (u8 - 128).
 
@@ -154,6 +196,7 @@ class NarrowSource:
     def __init__(self, args):
         self.args = args
         self.dec = None
+        self.nco = Nco(FS)
 
     def decimate(self, sr, d):
         self.dec = Decimator(FS, sr, d)
@@ -180,7 +223,7 @@ class NarrowSource:
             dc = DcBlock()
             try:
                 while d := rx.s.recv(65536):
-                    x = dc.process(d)
+                    x = self.nco.process(dc.process(d))
                     sink.write(self.dec.process(x) if self.dec else x.tobytes())
             except (BrokenPipeError, OSError, ValueError):
                 pass
@@ -215,6 +258,7 @@ class WideSource:
             self.port = board.ensure(board.RX, port=args.device, load="always", log=log)
         # espdr-rx maps 0..49.6 dB to the gain selector 30..80
         self.selector = round(30 + max(0.0, min(49.6, args.gain)) * 50 / 49.6)
+        self.nco = Nco(FS_WIDE)
 
     def _cmd(self, freq, seconds):
         return [sys.executable, "-m", "espdr.nb", "-p", self.port, "run", "--freq", str(round(freq)), "--decim", "2",
@@ -236,9 +280,13 @@ class WideSource:
                                      stderr=None if self.args.verbose else subprocess.DEVNULL)
 
         def pump():
+            odd = b""                                      # bytes of an incomplete cf32 sample
             try:
                 while d := self.proc.stdout.read1(65536):
-                    sink.write(d)
+                    d = odd + d
+                    k = len(d) // 8 * 8
+                    odd = d[k:]
+                    sink.write(self.nco.process(np.frombuffer(d[:k], np.complex64)).tobytes())
             except (BrokenPipeError, OSError, ValueError):
                 pass
         threading.Thread(target=pump, daemon=True).start()
@@ -327,6 +375,7 @@ def main():
     ap.add_argument("--gain", type=float, default=10, help="receiver gain in dB, 0..49.6 (default 10)")
     ap.add_argument("--ppm", type=float, default=0, help="crystal correction passed to espdr-rx")
     ap.add_argument("--no-search", action="store_true", help="tune exactly to --freq, do not look for the signal")
+    ap.add_argument("--no-track", action="store_true", help="do not follow the transmitter's drift (software NCO)")
     ap.add_argument("--record", metavar="FILE.ts", help="also write the transport stream to this file")
     ap.add_argument("--no-play", action="store_true", help="do not start ffplay (use with --record or --stdout)")
     ap.add_argument("--stdout", action="store_true", help="write the transport stream to stdout")
@@ -433,8 +482,13 @@ def main():
             with os.fdopen(info_r, "r", errors="ignore") as f:
                 for line in f:
                     k, _, v = line.strip().partition(" ")
-                    if k in ("MER", "CNR", "FREQ", "LOCK"):
+                    if k in ("MER", "CNR", "FREQ", "LOCK", "FRAMELOCK"):
                         info[k] = v
+                    if k == "FREQ" and not args.no_track:
+                        try:
+                            src.nco.track(float(v), float(info.get("MER", "nan")), info.get("FRAMELOCK") == "1")
+                        except ValueError:
+                            pass
 
         def pump_ts():
             while d := dvb.stdout.read1(65536):
@@ -471,6 +525,8 @@ def main():
             now = (stats["good"], stats["bad"], stats["locks"], stats["ts"])
             q = "".join(f", {k} {info[k]}" + (" dB" if k in ("MER", "CNR") else " Hz" if k == "FREQ" else "")
                         for k in ("MER", "CNR", "FREQ") if k in info)
+            if src.nco.updates:
+                q += f", NCO {src.nco.freq:+.0f} Hz ({src.nco.rate:+.0f} Hz/s)"
             if now != last or q:
                 log(f"frames ok {stats['good']}, with errors {stats['bad']}, locks {stats['locks']}, "
                     f"TS packets {stats['ts']}{q}")

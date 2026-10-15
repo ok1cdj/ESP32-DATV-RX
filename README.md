@@ -111,6 +111,7 @@ without errors. Ctrl-C or closing the window ends it.
 | `--frame` | normal | DVB-S2 FECFRAME size: `normal`, `short` (16200 bits) or `auto` (both) |
 | `--gain dB` | 10 | receiver gain, 0 to 49.6 dB |
 | `--no-search` | | tune exactly to `--freq` |
+| `--no-track` | | do not follow the transmitter's drift (by default a software NCO ramps after it: about 500 Hz behind at 260 Hz/s) |
 | `--record FILE.ts` | | also save the transport stream |
 | `--no-play`, `--stdout` | | no window; TS to stdout (for VLC, ffmpeg, ...) |
 | `--ldpc` | auto | `tool`: ldpc_tool (soft decision), `bitflip`: leandvb's own decoder; auto takes ldpc_tool if built |

@@ -1,0 +1,129 @@
+leandvb (leansdr work 84c59e1) DVB-S2 acquisition fixes; applies after leandvb-ldpc-helper.patch.
+
+1. The PLHEADER search window covered MIN_SYMBOLS_PER_FRAME, 39 % of a normal QPSK frame: often it held no PLHEADER and
+   the best correlation was in the data, a false lock (MER -12..-15 dB) that could last many seconds. With normal
+   frames allowed it now covers the longest frame.
+2. The first frame's PLSCODE was decoded from LLRs with only the rough frequency of the differential correlator; a
+   ~180 deg rotation across the PLHEADER turns a code into the one that differs in its second half (QPSK 3/5 -> 1/2,
+   5/6 -> 4/5), and the lock then kept a carrier off by whole cycles between pilots: those MODCODs never decoded.
+   Now every allowed code gets its own frequency/phase/amplitude fit and the best MER wins (a fit more than Rs/16
+   away from the LLR candidate's is skipped: the PILOTS bit looks like a shift of Rs/2).
+3. A first PLHEADER more than 6 dB below its MODCOD's Es/N0 is not locked on.
+
+--- a/src/leansdr/dvbs2.h
++++ b/src/leansdr/dvbs2.h
+@@ -21,6 +21,7 @@
+ #define LEANSDR_DVBS2_H
+ 
+ #include <sys/select.h>
++#include <vector>
+ #include "leansdr/sdr.h"
+ #include "leansdr/softword.h"
+ #include "leansdr/dvb.h"
+@@ -551,7 +552,13 @@
+ 
+       sampler->update_freq(ss_cache.fw16/omega0);
+ 
+-      const int search_range = modcod_info::MIN_SYMBOLS_PER_FRAME;
++      // The window must hold a whole frame, or it may contain no PLHEADER
++      // at all and the best correlation is then somewhere in the data
++      // (false lock).  MIN_SYMBOLS_PER_FRAME covers only 39% of a normal
++      // QPSK frame; the input buffer holds two of the longest frames.
++      const int search_range = (framesizes&1) ?
++	modcod_info::MAX_SYMBOLS_PER_FRAME :
++	modcod_info::MIN_SYMBOLS_PER_FRAME;
+       ss_cache.p = in.rd();
+       float q = find_plheader(&ss_cache, search_range);
+ 
+@@ -690,6 +697,9 @@
+ 	return;
+       }
+ 
++      if ( state == FRAME_PROBE )
++	plscode_index = probe_plscode(plh_symbols, &ss, plscode_index);
++
+       // ss now points to first data slot.
+       ss.scr = scrambling.Rn;
+ 
+@@ -719,6 +729,16 @@
+ 
+       // Parse PLSCODE.
+ 
++      if ( state == FRAME_PROBE && plscode_index>=4 &&
++	   mer_plh_db < modcod_infos[plscode_index>>2].esn0_nf - PROBE_MER_MARGIN ) {
++	// A first PLHEADER this far below what its MODCOD needs is not a
++	// real one (or the carrier estimate is off): do not lock on it.
++	if ( sch->debug ) fprintf(stderr, "PROBE: PLHEADER MER %.1f dB, ignored\n", mer_plh_db);
++	in.read(ss.p-in.rd());
++	enter_frame_detect();
++	return;
++      }
++
+       s2_pls pls;
+       pls.modcod = plscode_index >> 2;  // Guaranteed 0..31
+       pls.sf = plscode_index & 2;
+@@ -1003,7 +1023,8 @@
+ 
+       for ( int imu=0; imu<interp; ++imu ) {
+ 	const int ndiffs = search_range + sof.LENGTH + plscodes.LENGTH;
+-	complex<T> diffs[ndiffs];
++	std::vector< complex<T> > vdiffs(ndiffs);  // Too big for the stack.
++	complex<T> *diffs = vdiffs.data();
+ 	sampler_state ss = *pss;
+ 	ss.mu += imu * ss.omega / interp;
+ 	// Compute rotation between consecutive symbols.
+@@ -1216,6 +1237,54 @@
+       return 1.0f / ev2;
+     }
+ 
++    // How far below the MODCOD's Es/N0 a first PLHEADER may be (dB).
++    static constexpr float PROBE_MER_MARGIN = 6;
++
++    // Maximum-likelihood PLSCODE for the first frame of a lock.
++    // The LLR decoder sees PLHEADER symbols with only the rough frequency
++    // from the differential correlator: a residual rotation of ~180 deg
++    // across the PLHEADER turns a PLSCODE into the one that differs in
++    // its second half (e.g. QPSK 3/5 -> 1/2, 5/6 -> 4/5), and the lock
++    // then follows the wrong carrier for good.  Here every allowed
++    // candidate gets its own frequency, phase and amplitude fit and the
++    // best MER wins.  A candidate whose frequency fit lands far from the
++    // LLR candidate's is skipped: the PILOTS bit negates every other
++    // symbol, which a fit would absorb as a carrier shift of Rs/2.
++    // plh_symbols[] is left unchanged.
++    int probe_plscode(const complex<float> *plh_symbols,
++		      const sampler_state *pss, int llr_index) {
++      const int PLH_LENGTH = sof.LENGTH + plscodes.LENGTH;
++      const float MAX_DFW16 = 65536.0f / 16;  // Rs/16
++      complex<float> expected[PLH_LENGTH];
++      for ( int i=0; i<sof.LENGTH; ++i ) expected[i] = sof.symbols[i];
++      int best = llr_index;
++      float best_m2 = -1, ref_fw16 = 0;
++      for ( int pass=0; pass<2; ++pass )  // LLR candidate first
++	for ( int c=0; c<plscodes.COUNT; ++c ) {
++	  if ( (c==llr_index) != (pass==0) ) continue;
++	  int mc = c >> 2, sf = (c>>1) & 1;
++	  if ( c!=llr_index &&
++	       !( mc && (modcods&(1<<mc)) && (framesizes&(1<<sf)) &&
++		  modcod_infos[mc].nslots_nf ) )
++	    continue;
++	  for ( int i=0; i<plscodes.LENGTH; ++i )
++	    expected[sof.LENGTH+i] = plscodes.symbols[c][i];
++	  complex<float> symbs[PLH_LENGTH];
++	  memcpy(symbs, plh_symbols, sizeof(symbs));
++	  sampler_state ssc = *pss;
++	  match_freq(expected, symbs, PLH_LENGTH, &ssc);
++	  if ( pass == 0 )
++	    ref_fw16 = ssc.fw16;
++	  else if ( fabsf(fmodfs(ssc.fw16-ref_fw16, 65536.0f)) > MAX_DFW16 )
++	    continue;
++	  float m2 = match_ph_amp(expected, symbs, PLH_LENGTH, &ssc);
++	  if ( m2 > best_m2 ) { best_m2 = m2; best = c; }
++	}
++      if ( sch->debug && best != llr_index )
++	fprintf(stderr, "PROBE: PLSCODE %d -> %d (ML)\n", llr_index, best);
++      return best;
++    }
++
+     // Adjust frequency in *pss by an integer number of cycles per data block
+     // so that phases align best on data symbols.
+     //

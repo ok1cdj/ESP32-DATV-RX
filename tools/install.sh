@@ -1,7 +1,7 @@
 #!/bin/sh
 # Install what rx_dvbs2.py needs, inside this folder:
 #   .venv/                 Python venv with espdr-rx and espdr.nb (firmware/*.whl, which carries the receiver firmware) and numpy
-#   build/leansdr/         leandvb from leansdr (work branch, DVB-S2 enabled, tools/leandvb-ldpc-helper.patch)
+#   build/leansdr/         leandvb from leansdr (work branch, DVB-S2 enabled, tools/leandvb-*.patch)
 #   build/LDPC/            ldpc_tool, the soft-decision LDPC decoder leandvb runs as a helper (Blockstream/LDPC)
 # System packages it expects: python3 python3-venv git g++ make ffmpeg
 #   sudo apt install python3 python3-venv git g++ make ffmpeg
@@ -35,6 +35,7 @@ fi
 git -C build/leansdr fetch -q origin work
 git -C build/leansdr checkout -q -f "$LEANSDR_COMMIT"
 git -C build/leansdr apply "$ROOT/tools/leandvb-ldpc-helper.patch"   # partial pipe reads/writes with ldpc_tool
+git -C build/leansdr apply "$ROOT/tools/leandvb-acquisition.patch"   # true first lock, QPSK 3/5 and 5/6
 make -C build/leansdr/src/apps leandvb \
   CXXFLAGS='-O3 -I.. -DVERSION="\"leansdr-work\"" -DLEANSDR_EXTENSIONS -Wno-sign-compare -Wno-array-bounds -Wno-unused-variable' \
   >build/leandvb-build.log 2>&1 || { echo "leandvb build failed, see build/leandvb-build.log"; exit 1; }

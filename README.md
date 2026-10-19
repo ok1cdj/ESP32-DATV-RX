@@ -178,8 +178,9 @@ gain, 4-bit quantisation costs about 0.07 dB at Es/N0 = 5 dB and 0.5 dB at 14 dB
 | | |
 |---|---|
 | `rx_dvbs2.py` | the receiver: espdr-rx or espdr.nb → leandvb → ffplay |
-| `tools/install.sh` | creates `.venv/`, builds leandvb (with `tools/leandvb-ldpc-helper.patch`) and ldpc_tool |
+| `tools/install.sh` | creates `.venv/`, builds leandvb (with the `tools/leandvb-*.patch` below) and ldpc_tool |
 | `tools/leandvb-ldpc-helper.patch` | lets leandvb talk to ldpc_tool through ordinary pipes (partial reads and writes, pipe size) |
+| `tools/leandvb-acquisition.patch` | DVB-S2 acquisition: no false first lock with normal frames (the PLHEADER search covers a whole frame), QPSK 3/5 and 5/6 decode (maximum-likelihood PLSCODE on the first frame) |
 | `tools/build-firmware.sh` | rebuilds `firmware/` from `esp32-sdr-trx/` (needs ESP-IDF v5.5) |
 | `tools/sim_wide.py` | offline test of resampling and 4-bit formats on a recording |
 | `tools/rtltcp_cat.py` | writes the I/Q of an rtl_tcp server to stdout (`rtltcp_cat.py FREQ_HZ [GAIN_DB]`) |

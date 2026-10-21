@@ -335,8 +335,8 @@ def start_espdr(args):
     sys.exit("espdr-rx did not start within 60 s")
 
 
-def search(src, freq):
-    """Find the signal near freq; return its centre frequency in Hz."""
+def search(src, freq, retuned=False):
+    """Find the signal near freq; return its centre frequency in Hz. retuned: freq is the estimate of an earlier search."""
     fs = src.fs
     x = src.grab(freq, 1.0)
     n = 1024
@@ -347,6 +347,13 @@ def search(src, freq):
     usable = np.abs(f) < 0.45 * fs
     floor = np.percentile(p[usable], 10)
     peak = np.percentile(p[usable], 95)
+    if peak - floor < 6 and retuned:
+        # tuned onto a signal wider than the window (400 kS/s in --wide): it fills the window and leaves no floor. Centre of
+        # the power above the weakest bin instead (a cut-off signal pulls it towards 0, the next step fixes that).
+        w = 10 ** ((p[usable] - p[usable].min()) / 10) - 1
+        centre = freq + float(np.sum(f[usable] * w) / np.sum(w))
+        log(f"search: the signal fills the window, power centre {centre / 1e6:.4f} MHz ({(centre - freq) / 1e3:+.1f} kHz)")
+        return centre
     if peak - floor < 6:
         log(f"search: no signal near {freq / 1e6:.4f} MHz (only {peak - floor:.1f} dB above the floor)")
         return None
@@ -463,8 +470,8 @@ def main():
         freq = args.freq * 1e6
         if not args.no_search:
             # A signal far off centre is cut by the +-166 kHz window: retune to the estimate and look again.
-            for _ in range(3):
-                found = search(src, freq)
+            for i in range(3):
+                found = search(src, freq, retuned=i > 0)
                 if found is None:
                     break
                 step, freq = found - freq, found

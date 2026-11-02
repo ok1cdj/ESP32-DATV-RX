@@ -9,8 +9,9 @@ on the sound's clock); one without sound (the stand-alone beacon of ESP32-DATV-S
 retimes the pictures - the beacon starts its time base again on every loop. --no-sound: always the latter.
 
 It starts espdr-rx when no rtl_tcp server is listening (espdr-rx loads the receiver firmware into the
-board's RAM when needed), looks for the signal near the given frequency, tunes to its centre and plays
-the transport stream. Ctrl-C or closing the video window ends it.
+board's RAM when needed), looks for the signal near the given frequency, tunes to its centre (below 100 kS/s
+80 kHz above it, away from the receiver's own hump around the LO) and plays the transport stream. Ctrl-C or closing
+the video window ends it.
 
 --wide receives up to about 333 kS/s. It needs the receiver firmware with the cs4 format (esp32-sdr-trx
 1.0.0rc4+cs4, installed by tools/install.sh); 333 ksps int8 through rtl_tcp is limited to about 200 kS/s.
@@ -39,6 +40,11 @@ def log(*a):
 HERE = os.path.dirname(os.path.abspath(__file__))
 FS = 333333  # espdr-rx --decim 3
 FS_WIDE = 500000  # espdr.nb --decim 2 --format cs4
+# Below 100 kS/s (333 ksps): the LO this far above the signal, the NCO brings it back to 0 Hz. The ESP32-S3 has a hump of
+# +-25 kHz around its LO (LO leakage, ADC offset; DcBlock takes out only the line at 0 Hz) that buries a weak signal
+# of 40 kS/s (54 kHz wide). Bench 2026-11-02, XIAO S3, 40 kS/s: gain selector 16..8 nothing decoded with the LO on the
+# signal, MER 9-12 dB with it 80 kHz off. 66 kS/s still fits: 35..125 kHz from the LO.
+LO_OFFSET = 80e3
 
 # DVB-S2 MODCOD numbers (EN 302 307-1, table 12), for leandvb's --modcods filter.
 MODCODS = {("QPSK", r): i + 1 for i, r in enumerate(("1/4", "1/3", "2/5", "1/2", "3/5", "2/3", "3/4", "4/5", "5/6", "8/9", "9/10"))}
@@ -419,6 +425,9 @@ def main():
     ap.add_argument("--gain", type=float, default=10, help="receiver gain in dB, 0..49.6 (default 10)")
     ap.add_argument("--ppm", type=float, default=0, help="crystal correction passed to espdr-rx")
     ap.add_argument("--no-search", action="store_true", help="tune exactly to --freq, do not look for the signal")
+    ap.add_argument("--lo-offset", type=float, metavar="KHZ",
+                    help="tune the LO this far above the signal and shift it back in software, away from the receiver's "
+                         "own hump around the LO (default 80 below 100 kS/s without --wide, else 0)")
     ap.add_argument("--no-track", action="store_true", help="do not follow the transmitter's drift (software NCO)")
     ap.add_argument("--sr-tol", type=float, default=0.002,
                     help="symbol rate tolerance (leandvb --sr-tol, default 0.002 = 2000 ppm; leandvb's own 100 ppm misses an "
@@ -477,6 +486,9 @@ def main():
                 step, freq = found - freq, found
                 if abs(step) < 5e3:
                     break
+
+        lo_off = args.lo_offset * 1e3 if args.lo_offset is not None else 0.0 if args.wide or args.sr >= 100e3 else LO_OFFSET
+        src.nco.freq = -lo_off
 
         fs_in = FS_WIDE if args.wide else FS
         if not args.wide and args.decimate and args.sr < 100e3 and FS // (2 * args.sr) >= 2:
@@ -585,11 +597,12 @@ def main():
                 if args.verbose:
                     sys.stderr.write(t)
 
-        src.start(freq, dvb.stdin)
+        src.start(freq + lo_off, dvb.stdin)
         for fn in (pump_ts, pump_log, pump_info):
             threading.Thread(target=fn, daemon=True).start()
 
-        log(f"receiving {freq / 1e6:.4f} MHz, {args.sr / 1e3:g} kS/s {args.const} {args.cr}, gain {args.gain:g} dB, "
+        log(f"receiving {freq / 1e6:.4f} MHz" + (f" (LO {lo_off / 1e3:+.0f} kHz)" if lo_off else "")
+            + f", {args.sr / 1e3:g} kS/s {args.const} {args.cr}, gain {args.gain:g} dB, "
             f"LDPC {'ldpc_tool' if ldpc_tool else 'bit-flip'}. Ctrl-C ends.")
         if ldpc_tool:
             log(f"ldpc_tool decodes 32 frames at a time: the first picture comes after about "
@@ -601,7 +614,7 @@ def main():
             q = "".join(f", {k} {info[k]}" + (" dB" if k in ("MER", "CNR") else " Hz" if k == "FREQ" else "")
                         for k in ("MER", "CNR", "FREQ") if k in info)
             if src.nco.updates:
-                q += f", NCO {src.nco.freq:+.0f} Hz ({src.nco.rate:+.0f} Hz/s)"
+                q += f", NCO {src.nco.freq + lo_off:+.0f} Hz ({src.nco.rate:+.0f} Hz/s)"
             if now != last or q:
                 log(f"frames ok {stats['good']}, with errors {stats['bad']}, locks {stats['locks']}, "
                     f"TS packets {stats['ts']}{q}")

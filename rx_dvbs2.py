@@ -45,6 +45,7 @@ FS_WIDE = 500000  # espdr.nb --decim 2 --format cs4
 # of 40 kS/s (54 kHz wide). Bench 2026-11-02, XIAO S3, 40 kS/s: gain selector 16..8 nothing decoded with the LO on the
 # signal, MER 9-12 dB with it 80 kHz off. 66 kS/s still fits: 35..125 kHz from the LO.
 LO_OFFSET = 80e3
+HUMP = 25e3  # +- around the LO
 
 # DVB-S2 MODCOD numbers (EN 302 307-1, table 12), for leandvb's --modcods filter.
 MODCODS = {("QPSK", r): i + 1 for i, r in enumerate(("1/4", "1/3", "2/5", "1/2", "3/5", "2/3", "3/4", "4/5", "5/6", "8/9", "9/10"))}
@@ -341,8 +342,9 @@ def start_espdr(args):
     sys.exit("espdr-rx did not start within 60 s")
 
 
-def search(src, freq, retuned=False):
-    """Find the signal near freq; return its centre frequency in Hz. retuned: freq is the estimate of an earlier search."""
+def search(src, freq, retuned=False, hump=0.0):
+    """Find the signal near freq; return its centre frequency in Hz. retuned: freq is the estimate of an earlier search.
+    hump: leave out +-hump Hz around the LO (freq is then the LO, not the signal)."""
     fs = src.fs
     x = src.grab(freq, 1.0)
     n = 1024
@@ -350,10 +352,10 @@ def search(src, freq, retuned=False):
     p = np.mean(np.abs(np.fft.fftshift(np.fft.fft(x[: seg * n].reshape(seg, n) * np.hanning(n), axis=1), axes=1)) ** 2, 0)
     p = np.convolve(10 * np.log10(p + 1e-9), np.ones(9) / 9, "same")
     f = (np.arange(n) - n / 2) * fs / n
-    usable = np.abs(f) < 0.45 * fs
+    usable = (np.abs(f) < 0.45 * fs) & (np.abs(f) >= hump)
     floor = np.percentile(p[usable], 10)
     peak = np.percentile(p[usable], 95)
-    if peak - floor < 6 and retuned:
+    if peak - floor < 6 and retuned and not hump:
         # tuned onto a signal wider than the window (400 kS/s in --wide): it fills the window and leaves no floor. Centre of
         # the power above the weakest bin instead (a cut-off signal pulls it towards 0, the next step fixes that).
         w = 10 ** ((p[usable] - p[usable].min()) / 10) - 1
@@ -488,6 +490,14 @@ def main():
                     break
 
         lo_off = args.lo_offset * 1e3 if args.lo_offset is not None else 0.0 if args.wide or args.sr >= 100e3 else LO_OFFSET
+        if lo_off and not args.no_search:
+            # The S3's hump on the LO alone looks like a 40 kS/s signal (7-20 dB above the floor, ~37 kHz wide) and
+            # swallows a weak one on it: look again with the LO lo_off above it and the hump left out (2026-11-04).
+            found = search(src, freq + lo_off, hump=HUMP)
+            if found is None:
+                log("search: nothing beside the receiver's own hump: what it found on the LO was probably the hump")
+            else:
+                freq = found
         src.nco.freq = -lo_off
 
         fs_in = FS_WIDE if args.wide else FS

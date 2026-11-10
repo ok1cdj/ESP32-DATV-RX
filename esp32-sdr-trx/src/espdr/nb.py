@@ -358,7 +358,7 @@ def cmd_run(args):
         raise ProtocolError("cs4 carries a gain per packet: use --convert cf32")
     shift = args.shift if args.shift is not None else (4 if fmt == 1 else 0)
     lo = configure_receiver(link, args.freq, args.decim, fmt, shift, args.gain)
-    rate = 1e6 / args.decim
+    rate = 4e5 if args.decim == 25 else 1e6 / args.decim
     need = rate * BYTES_PER_SAMPLE[fmt] / 1e6
     print(f"LO {lo / 1e6:.6f} MHz, {rate / 1e3:.0f} ksps {args.format}, usable +-{rate * 0.4 / 1e3:.0f} kHz, "
           f"{need:.2f} MB/s over USB", file=sys.stderr)
@@ -526,9 +526,9 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("run", help="tune, run and stream")
     r.add_argument("--freq", type=float, required=True, help="LO frequency in Hz (e.g. 2400.1e6)")
-    r.add_argument("--decim", type=int, choices=(2, 3, 4), default=4,
+    r.add_argument("--decim", type=int, choices=(2, 3, 4, 25), default=4,
                    help="4: 250 ksps (+-100 kHz usable, default); 3: 333 ksps (+-133 kHz); 2: 500 ksps, which needs 1.0 MB/s - "
-                        "more than this USB link delivers, so samples are lost")
+                        "more than this USB link delivers, so samples are lost; 25: 400 ksps, the ESP32-C5 receiver only")
     r.add_argument("--format", choices=sorted(FORMATS), default="cs8")
     r.add_argument("--shift", type=int, help="output right shift (default 4 for cs8, 0 for cs16)")
     r.add_argument("--gain", type=int, default=60,
